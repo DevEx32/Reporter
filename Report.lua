@@ -186,29 +186,72 @@ local function diffSnapshots(before, after)
 end
 
 -- ============================================
--- TRADE REMOTES
+-- TRADE REMOTES + UI HELPERS
 -- ============================================
 
 local API = ReplicatedStorage:WaitForChild("API")
+local GuiService = game:GetService("GuiService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
 
-local function acceptTradeRequest()
-    pcall(function()
-        local remote = API:FindFirstChild("TradeAPI/AcceptTradeRequest")
-        if remote then remote:FireServer() end
-    end)
+-- Print every trade-related remote so names can be verified if something fails
+print("🔎 Trade remotes found:")
+for _, child in ipairs(API:GetChildren()) do
+    if child.Name:find("TradeAPI") then
+        print("   " .. child.Name)
+    end
 end
 
-local function readyTrade()
-    pcall(function()
-        local remote = API:FindFirstChild("TradeAPI/SetPlayerReady")
-        if remote then remote:FireServer() end
+local function fireRemote(name, ...)
+    local remote = API:FindFirstChild(name)
+    if not remote then return false end
+    local args = { ... }
+    task.spawn(function()
+        pcall(function()
+            if remote:IsA("RemoteFunction") then
+                remote:InvokeServer(unpack(args))
+            else
+                remote:FireServer(unpack(args))
+            end
+        end)
     end)
+    return true
 end
 
-local function confirmTrade()
-    pcall(function()
-        local remote = API:FindFirstChild("TradeAPI/ConfirmTrade")
-        if remote then remote:FireServer({}) end
+local function acceptNegotiation() fireRemote("TradeAPI/AcceptNegotiation") end
+local function confirmTrade() fireRemote("TradeAPI/ConfirmTrade") end
+
+-- Is this GUI object actually visible on screen (all parents shown)?
+local function isShown(obj)
+    local p = obj
+    while p and p ~= LocalPlayer.PlayerGui do
+        if p:IsA("GuiObject") and not p.Visible then return false end
+        if p:IsA("ScreenGui") and not p.Enabled then return false end
+        p = p.Parent
+    end
+    return obj.AbsoluteSize.X > 0
+end
+
+-- Find a visible label/button whose text is exactly `wanted` (case-insensitive)
+local function findButtonByText(root, wanted)
+    if not root then return nil end
+    for _, d in ipairs(root:GetDescendants()) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text ~= "" and isShown(d) then
+            local t = d.Text:lower():gsub("%s+", "")
+            if t == wanted then return d end
+        end
+    end
+    return nil
+end
+
+-- Simulate a real mouse click in the middle of a GUI object
+local function clickGuiObject(obj)
+    return pcall(function()
+        local sg = obj:FindFirstAncestorOfClass("ScreenGui")
+        local inset = (sg and sg.IgnoreGuiInset) and Vector2.new(0, 0) or GuiService:GetGuiInset()
+        local pos = obj.AbsolutePosition + obj.AbsoluteSize / 2 + inset
+        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 1)
+        task.wait(0.05)
+        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
     end)
 end
 
@@ -217,29 +260,106 @@ local function tradeGuiVisible()
     return gui and gui.Frame and gui.Frame.Visible
 end
 
--- ============================================
--- TRACK WHO SENT THE CURRENT TRADE
--- ============================================
+-- ---- incoming trade request popup ----
 
+-- Returns the DialogApp + its text if a trade request popup is showing (and allowed by FROM_PLAYER)
+local function pendingTradeRequestDialog()
+    local gui = LocalPlayer.PlayerGui:FindFirstChild("DialogApp")
+    if not gui or not gui.Enabled then return nil end
+
+    for _, d in ipairs(gui:GetDescendants()) do
+        if d:IsA("TextLabel") and d.Text ~= "" and isShown(d) then
+            local t = d.Text:lower()
+            if t:find("trade request", 1, true) then
+                if CONFIG.FROM_PLAYER then
+                    local want = tostring(CONFIG.FROM_PLAYER):lower()
+                    local plr = Players:FindFirstChild(CONFIG.FROM_PLAYER)
+                    local okName = t:find(want, 1, true)
+                    local okDisplay = plr and t:find(plr.DisplayName:lower(), 1, true)
+                    if not okName and not okDisplay then return nil end
+                end
+                return gui, d.Text
+            end
+        end
+    end
+    return nil
+end
+
+-- Remote route (best guess at the game's remote) - cycles through players in the server
+local requestIndex = 0
+local function acceptIncomingRequestsRemote()
+    local candidates = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and (not CONFIG.FROM_PLAYER or p.Name:lower() == tostring(CONFIG.FROM_PLAYER):lower()) then
+            table.insert(candidates, p)
+        end
+    end
+    if #candidates == 0 then return end
+    requestIndex = (requestIndex % #candidates) + 1
+    fireRemote("TradeAPI/AcceptOrDeclineTradeRequest", candidates[requestIndex], true)
+end
+
+local function handleIncomingRequests()
+    acceptIncomingRequestsRemote()
+
+    local dialog, text = pendingTradeRequestDialog()
+    if not dialog then return end
+
+    task.wait(1) -- give the remote a moment to work first
+    dialog = pendingTradeRequestDialog()
+    if dialog then
+        local btn = findButtonByText(dialog, "accept")
+        if btn then
+            print("🖱️ Popup still open - clicking Accept: " .. tostring(text))
+            clickGuiObject(btn)
+        end
+    end
+end
+
+-- ---- trade window: Accept -> wait -> Confirm (same order as a manual trade) ----
+
+local function handleTradeWindow()
+    local gui = LocalPlayer.PlayerGui:FindFirstChild("TradeApp")
+
+    acceptNegotiation()
+    task.wait(1)
+    local acceptBtn = findButtonByText(gui, "accept")
+    if acceptBtn then
+        print("🖱️ Still on Accept screen - clicking Accept")
+        clickGuiObject(acceptBtn)
+    end
+
+    task.wait(0.5)
+    confirmTrade()
+    task.wait(1)
+    local confirmBtn = findButtonByText(gui, "confirm")
+    if confirmBtn then
+        print("🖱️ Still on Confirm screen - clicking Confirm")
+        clickGuiObject(confirmBtn)
+    end
+    task.wait(0.5)
+end
+
+-- Work out who we're trading with by finding a player's name in the trade window text
 local currentTrader = nil
 
-local TradeEvents = ReplicatedStorage:FindFirstChild("TradeEvents")
-if TradeEvents then
-    local tradeRequestEvent = TradeEvents:FindFirstChild("TradeRequest")
-    if tradeRequestEvent then
-        tradeRequestEvent.OnClientEvent:Connect(function(traderUsername)
-            print(string.format("\n📨 Trade request from: %s", tostring(traderUsername)))
-
-            if CONFIG.FROM_PLAYER and traderUsername ~= CONFIG.FROM_PLAYER then
-                print("❌ Ignoring (not from " .. CONFIG.FROM_PLAYER .. ")")
-                return
+local function guessTrader()
+    local found = nil
+    pcall(function()
+        local gui = LocalPlayer.PlayerGui:FindFirstChild("TradeApp")
+        if not gui then return end
+        for _, d in ipairs(gui:GetDescendants()) do
+            if d:IsA("TextLabel") and d.Text ~= "" then
+                for _, p in ipairs(Players:GetPlayers()) do
+                    if p ~= LocalPlayer and (d.Text:find(p.Name, 1, true) or d.Text:find(p.DisplayName, 1, true)) then
+                        found = p.Name
+                        return
+                    end
+                end
             end
-
-            currentTrader = traderUsername
-            task.wait(0.5)
-            acceptTradeRequest()
-        end)
-    end
+        end
+    end)
+    return found
 end
 
 -- ============================================
@@ -269,13 +389,22 @@ local beforeSnapshot = nil
 local tradesHandled = 0
 local startTime = os.time()
 
+-- Loop 1: watch for incoming trade requests
 spawn(function()
     while running do
-        -- Background accept/ready/confirm spam while a trade window is open
-        acceptTradeRequest()
-        readyTrade()
-        confirmTrade()
-        task.wait(0.4)
+        pcall(handleIncomingRequests)
+        task.wait(0.6)
+    end
+end)
+
+-- Loop 2: while a trade window is open, accept -> confirm in order
+spawn(function()
+    while running do
+        if tradeGuiVisible() then
+            pcall(handleTradeWindow)
+        else
+            task.wait(0.5)
+        end
     end
 end)
 
@@ -299,6 +428,7 @@ while running do
         -- Trade window just opened - snapshot inventory now, before anything is added
         print("📋 Trade window opened - taking before-snapshot")
         beforeSnapshot = snapshotInventory()
+        task.delay(1.5, function() currentTrader = guessTrader() end)
 
     elseif not isOpen and wasTradeOpen then
         -- Trade window just closed - trade either completed or was cancelled
