@@ -22,6 +22,14 @@ end
 -- Set to 0 to disable.
 if CONFIG.HEARTBEAT_INTERVAL == nil then CONFIG.HEARTBEAT_INTERVAL = 900 end -- 15 min default
 
+-- Server player reporting
+if CONFIG.REPORT_JOINS == nil then CONFIG.REPORT_JOINS = true end            -- report who joins/leaves
+if CONFIG.JOIN_REPORT_INTERVAL == nil then CONFIG.JOIN_REPORT_INTERVAL = 60 end -- batch joins/leaves into one message per X sec
+if CONFIG.LIST_PLAYERS_ON_START == nil then CONFIG.LIST_PLAYERS_ON_START = true end
+
+-- Optional: simulate clicks on the on-screen Accept/Confirm buttons (off by default)
+if CONFIG.USE_CLICK_FALLBACK == nil then CONFIG.USE_CLICK_FALLBACK = false end
+
 -- ============================================
 -- SETUP
 -- ============================================
@@ -99,7 +107,7 @@ local Data = require(ReplicatedStorage.ClientModules.Core.ClientData)
 -- TELEGRAM SEND
 -- ============================================
 
-local function sendMessengerText(text)
+local function sendTelegram(text)
     local ok, response = pcall(function()
         return request({
             Url = "https://api.telegram.org/bot" .. CONFIG.BOT_TOKEN .. "/sendMessage",
@@ -125,6 +133,20 @@ local function sendMessengerText(text)
     warn("❌ Telegram send failed: HTTP " .. tostring(response.StatusCode) .. " - " .. tostring(response.Body))
     warn("   (Check BOT_TOKEN and CHAT_ID, and make sure you pressed Start on your bot)")
     return false
+end
+
+-- Split long messages (Telegram limit is ~4096 chars)
+local function sendLong(text)
+    if #text <= 3800 then return sendTelegram(text) end
+    local chunk = ""
+    for line in (text .. "\n"):gmatch("(.-)\n") do
+        if #chunk + #line + 1 > 3800 then
+            sendTelegram(chunk)
+            chunk = ""
+        end
+        chunk = chunk .. line .. "\n"
+    end
+    if chunk ~= "" then sendTelegram(chunk) end
 end
 
 -- ============================================
@@ -228,6 +250,9 @@ local function isShown(obj)
         if p:IsA("ScreenGui") and not p.Enabled then return false end
         p = p.Parent
     end
+    if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and obj.TextTransparency > 0.6 then
+        return false -- faded/leftover text, not a live prompt
+    end
     return obj.AbsoluteSize.X > 0
 end
 
@@ -285,59 +310,103 @@ local function pendingTradeRequestDialog()
     return nil
 end
 
--- Remote route (best guess at the game's remote) - cycles through players in the server
-local requestIndex = 0
-local function acceptIncomingRequestsRemote()
-    local candidates = {}
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= LocalPlayer and (not CONFIG.FROM_PLAYER or p.Name:lower() == tostring(CONFIG.FROM_PLAYER):lower()) then
-            table.insert(candidates, p)
+-- Players named in a visible "trade request" popup (the sender's name is in the text)
+local function getRequesters()
+    local found = {}
+    local gui = LocalPlayer.PlayerGui:FindFirstChild("DialogApp")
+    if gui then
+        for _, d in ipairs(gui:GetDescendants()) do
+            if d:IsA("TextLabel") and d.Text ~= "" and isShown(d) then
+                local t = d.Text:lower()
+                if t:find("trade request", 1, true) then
+                    for _, p in ipairs(Players:GetPlayers()) do
+                        if p ~= LocalPlayer and (t:find(p.Name:lower(), 1, true) or t:find(p.DisplayName:lower(), 1, true)) then
+                            found[p] = true
+                        end
+                    end
+                end
+            end
         end
     end
-    if #candidates == 0 then return end
-    requestIndex = (requestIndex % #candidates) + 1
-    fireRemote("TradeAPI/AcceptOrDeclineTradeRequest", candidates[requestIndex], true)
+    local list = {}
+    for p in pairs(found) do table.insert(list, p) end
+    return list
 end
 
+-- FROM_PLAYER = nil means accept trades from anyone
+local function requesterAllowed(p)
+    if not CONFIG.FROM_PLAYER then return true end
+    return p.Name:lower() == tostring(CONFIG.FROM_PLAYER):lower()
+end
+
+local requestIndex = 0
+local function acceptRequests()
+    local targets = {}
+    for _, p in ipairs(getRequesters()) do
+        if requesterAllowed(p) then table.insert(targets, p) end
+    end
+
+    if #targets == 0 then
+        -- popup not readable: cycle through a few players per tick instead
+        local candidates = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and requesterAllowed(p) then table.insert(candidates, p) end
+        end
+        for _ = 1, math.min(3, #candidates) do
+            requestIndex = (requestIndex % #candidates) + 1
+            table.insert(targets, candidates[requestIndex])
+        end
+    end
+
+    for _, p in ipairs(targets) do
+        fireRemote("TradeAPI/AcceptOrDeclineTradeRequest", p, true)
+    end
+end
+
+local popupState = { clicks = 0, ignoreUntil = 0 }
+local MAX_POPUP_CLICKS = 3
+
 local function handleIncomingRequests()
-    acceptIncomingRequestsRemote()
+    acceptRequests()
+
+    if not CONFIG.USE_CLICK_FALLBACK then return end
 
     local dialog, text = pendingTradeRequestDialog()
-    if not dialog then return end
+    if not dialog then
+        popupState.clicks = 0
+        return
+    end
+    if tradeGuiVisible() or os.clock() < popupState.ignoreUntil then return end
+    if popupState.clicks >= MAX_POPUP_CLICKS then return end
 
-    task.wait(1) -- give the remote a moment to work first
+    task.wait(1)
     dialog = pendingTradeRequestDialog()
-    if dialog then
+    if dialog and not tradeGuiVisible() then
         local btn = findButtonByText(dialog, "accept")
         if btn then
-            print("🖱️ Popup still open - clicking Accept: " .. tostring(text))
+            popupState.clicks = popupState.clicks + 1
+            print(string.format("🖱️ Clicking Accept on popup (%d/%d): %s", popupState.clicks, MAX_POPUP_CLICKS, tostring(text)))
             clickGuiObject(btn)
         end
     end
 end
 
--- ---- trade window: Accept -> wait -> Confirm (same order as a manual trade) ----
+-- ---- trade window: Accept and Confirm, once per second ----
 
 local function handleTradeWindow()
     local gui = LocalPlayer.PlayerGui:FindFirstChild("TradeApp")
 
     acceptNegotiation()
-    task.wait(1)
-    local acceptBtn = findButtonByText(gui, "accept")
-    if acceptBtn then
-        print("🖱️ Still on Accept screen - clicking Accept")
-        clickGuiObject(acceptBtn)
-    end
-
     task.wait(0.5)
     confirmTrade()
-    task.wait(1)
-    local confirmBtn = findButtonByText(gui, "confirm")
-    if confirmBtn then
-        print("🖱️ Still on Confirm screen - clicking Confirm")
-        clickGuiObject(confirmBtn)
-    end
     task.wait(0.5)
+
+    if CONFIG.USE_CLICK_FALLBACK then
+        local acceptBtn = findButtonByText(gui, "accept")
+        if acceptBtn then clickGuiObject(acceptBtn) end
+        local confirmBtn = findButtonByText(gui, "confirm")
+        if confirmBtn then clickGuiObject(confirmBtn) end
+    end
 end
 
 -- Work out who we're trading with by finding a player's name in the trade window text
@@ -377,7 +446,7 @@ else
 end
 print(("="):rep(50) .. "\n")
 
-sendMessengerText(string.format("🟢 %s is now online and auto-accepting trades.", playerName))
+sendTelegram(string.format("🟢 %s is now online and auto-accepting trades.", playerName))
 
 -- ============================================
 -- MAIN LOOP: watch for trade open -> close transitions
@@ -389,11 +458,66 @@ local beforeSnapshot = nil
 local tradesHandled = 0
 local startTime = os.time()
 
+-- ============================================
+-- SERVER PLAYER REPORTING
+-- ============================================
+
+local function formatPlayer(p)
+    if p.DisplayName ~= p.Name then
+        return string.format("%s (@%s)", p.DisplayName, p.Name)
+    end
+    return "@" .. p.Name
+end
+
+local function serverSummary()
+    local lines = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then table.insert(lines, "• " .. formatPlayer(p)) end
+    end
+    table.sort(lines)
+    local header = string.format("👥 %d player%s in server (id %s)",
+        #Players:GetPlayers(), #Players:GetPlayers() == 1 and "" or "s", string.sub(game.JobId, 1, 8))
+    return header .. (#lines > 0 and ("\n" .. table.concat(lines, "\n")) or "")
+end
+
+if CONFIG.LIST_PLAYERS_ON_START then
+    sendLong(serverSummary())
+end
+
+if CONFIG.REPORT_JOINS and CONFIG.JOIN_REPORT_INTERVAL > 0 then
+    local joinedBuf, leftBuf = {}, {}
+
+    Players.PlayerAdded:Connect(function(p)
+        table.insert(joinedBuf, formatPlayer(p))
+    end)
+    Players.PlayerRemoving:Connect(function(p)
+        if p ~= LocalPlayer then table.insert(leftBuf, formatPlayer(p)) end
+    end)
+
+    spawn(function()
+        while running do
+            task.wait(CONFIG.JOIN_REPORT_INTERVAL)
+            if #joinedBuf > 0 or #leftBuf > 0 then
+                local parts = {}
+                if #joinedBuf > 0 then
+                    table.insert(parts, string.format("➕ Joined (%d): %s", #joinedBuf, table.concat(joinedBuf, ", ")))
+                end
+                if #leftBuf > 0 then
+                    table.insert(parts, string.format("➖ Left (%d): %s", #leftBuf, table.concat(leftBuf, ", ")))
+                end
+                table.insert(parts, string.format("👥 Now %d players in server", #Players:GetPlayers()))
+                joinedBuf, leftBuf = {}, {}
+                sendLong(table.concat(parts, "\n"))
+            end
+        end
+    end)
+end
+
 -- Loop 1: watch for incoming trade requests
 spawn(function()
     while running do
         pcall(handleIncomingRequests)
-        task.wait(0.6)
+        task.wait(1)
     end
 end)
 
@@ -413,9 +537,9 @@ if CONFIG.HEARTBEAT_INTERVAL and CONFIG.HEARTBEAT_INTERVAL > 0 then
         while running do
             task.wait(CONFIG.HEARTBEAT_INTERVAL)
             local uptimeMin = math.floor((os.time() - startTime) / 60)
-            sendMessengerText(string.format(
-                "🟢 %s still online — up %dm, %d trade%s handled.",
-                playerName, uptimeMin, tradesHandled, tradesHandled == 1 and "" or "s"
+            sendTelegram(string.format(
+                "🟢 %s still online — up %dm, %d trade%s handled, %d players in server.",
+                playerName, uptimeMin, tradesHandled, tradesHandled == 1 and "" or "s", #Players:GetPlayers()
             ))
         end
     end)
@@ -433,6 +557,7 @@ while running do
     elseif not isOpen and wasTradeOpen then
         -- Trade window just closed - trade either completed or was cancelled
         print("📋 Trade window closed - checking what changed")
+        popupState.ignoreUntil = os.clock() + 12
         task.wait(2) -- let inventory sync server-side before reading it
 
         local afterSnapshot = snapshotInventory()
@@ -461,7 +586,7 @@ while running do
                 .. string.format("\n\nTotal items: %d", totalCount)
 
             print("\n" .. message .. "\n")
-            sendMessengerText(message)
+            sendTelegram(message)
             tradesHandled = tradesHandled + 1
         else
             print("ℹ️ No items gained (trade may have been declined/cancelled)")
